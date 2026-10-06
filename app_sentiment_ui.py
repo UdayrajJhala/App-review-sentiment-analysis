@@ -1,6 +1,6 @@
 import gradio as gr
 import torch
-from transformers import BertTokenizer, BertForSequenceClassification
+from transformers import AutoTokenizer, BertForSequenceClassification
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -14,13 +14,14 @@ import base64
 from io import BytesIO
 import re
 import urllib.parse
+import tempfile
 
 warnings.filterwarnings("ignore")
 
 # Load the trained model and tokenizer
 print("Loading model...")
-model_path = "./app_review_sentiment_bert"
-tokenizer = BertTokenizer.from_pretrained(model_path)
+model_path = "./bert_sentiment_model"
+tokenizer = AutoTokenizer.from_pretrained(model_path)
 model = BertForSequenceClassification.from_pretrained(model_path)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = model.to(device)
@@ -30,16 +31,13 @@ print(f"Model loaded successfully on {device}!")
 # Sentiment mappings
 SENTIMENT_LABELS = {0: "Negative", 1: "Neutral", 2: "Positive"}
 SENTIMENT_EMOJI = {0: "😞", 1: "😐", 2: "😊"}
-SENTIMENT_COLORS = {0: "#FF6B6B", 1: "#FFD93D", 2: "#6BCF7F"}  # Red  # Yellow  # Green
+SENTIMENT_COLORS = {0: "#FF6B6B", 1: "#FFD93D", 2: "#6BCF7F"}  # Red, Yellow, Green
 
 
-def predict_sentiment(review_text):
-    """Predict sentiment for a single review"""
-    if not review_text or review_text.strip() == "":
-        return "Please enter a review to analyze.", ""
-
-    encoding = tokenizer.encode_plus(
-        review_text,
+def encode(text):
+    """Tokenize a single text (replaces the removed tokenizer.encode_plus)"""
+    return tokenizer(
+        text,
         add_special_tokens=True,
         max_length=128,
         padding="max_length",
@@ -47,6 +45,14 @@ def predict_sentiment(review_text):
         return_attention_mask=True,
         return_tensors="pt",
     )
+
+
+def predict_sentiment(review_text):
+    """Predict sentiment for a single review"""
+    if not review_text or review_text.strip() == "":
+        return "Please enter a review to analyze.", ""
+
+    encoding = encode(review_text)
 
     input_ids = encoding["input_ids"].to(device)
     attention_mask = encoding["attention_mask"].to(device)
@@ -88,15 +94,7 @@ def predict_batch(reviews_list):
             predictions.append(1)  # neutral for empty
             continue
 
-        encoding = tokenizer.encode_plus(
-            review_text,
-            add_special_tokens=True,
-            max_length=128,
-            padding="max_length",
-            truncation=True,
-            return_attention_mask=True,
-            return_tensors="pt",
-        )
+        encoding = encode(review_text)
 
         input_ids = encoding["input_ids"].to(device)
         attention_mask = encoding["attention_mask"].to(device)
@@ -114,12 +112,11 @@ def extract_package_name(url_or_package):
     """Extract package name from Google Play Store URL or return as-is if already a package name"""
     if not url_or_package or url_or_package.strip() == "":
         return ""
-    
+
     url_or_package = url_or_package.strip()
-    
+
     # If it looks like a URL, extract the package name
     if "play.google.com" in url_or_package or url_or_package.startswith("http"):
-        # Parse the URL and extract id parameter
         try:
             if "id=" in url_or_package:
                 # Extract everything after id=
@@ -128,13 +125,13 @@ def extract_package_name(url_or_package):
                 if "&" in package_name:
                     package_name = package_name.split("&")[0]
                 return package_name
-        except:
+        except Exception:
             pass
-    
+
     # If it doesn't contain dots, it's probably not a valid package name
     if "." not in url_or_package:
         return ""
-    
+
     # Otherwise, assume it's already a package name
     return url_or_package
 
@@ -154,7 +151,7 @@ def scrape_and_analyze(app_url_or_id, num_reviews=100):
     try:
         # Extract package name from URL or use as-is
         app_id = extract_package_name(app_url_or_id)
-        
+
         # Validate inputs
         if not app_id or app_id.strip() == "":
             return "Please enter a valid Google Play Store URL or app package name.", "", ""
@@ -200,22 +197,14 @@ def scrape_and_analyze(app_url_or_id, num_reviews=100):
         # Predict sentiments with confidence scores
         predictions = []
         confidence_scores = []
-        
+
         for review_text in review_texts:
             if not review_text or review_text.strip() == "":
                 predictions.append(1)  # neutral for empty
                 confidence_scores.append(0.5)
                 continue
 
-            encoding = tokenizer.encode_plus(
-                review_text,
-                add_special_tokens=True,
-                max_length=128,
-                padding="max_length",
-                truncation=True,
-                return_attention_mask=True,
-                return_tensors="pt",
-            )
+            encoding = encode(review_text)
 
             input_ids = encoding["input_ids"].to(device)
             attention_mask = encoding["attention_mask"].to(device)
@@ -226,7 +215,7 @@ def scrape_and_analyze(app_url_or_id, num_reviews=100):
                 probabilities = torch.nn.functional.softmax(logits, dim=1)
                 predicted_class = torch.argmax(probabilities, dim=1).item()
                 confidence = probabilities[0][predicted_class].item()
-                
+
                 predictions.append(predicted_class)
                 confidence_scores.append(confidence)
 
@@ -270,7 +259,7 @@ def scrape_and_analyze(app_url_or_id, num_reviews=100):
         sentiment_by_stars = (
             df.groupby(["Star_Rating", "AI_Sentiment"]).size().unstack(fill_value=0)
         )
-        
+
         # Create color mapping based on actual column order
         column_colors = []
         for col in sentiment_by_stars.columns:
@@ -280,7 +269,7 @@ def scrape_and_analyze(app_url_or_id, num_reviews=100):
                 column_colors.append(SENTIMENT_COLORS[1])  # Yellow
             elif col == "Positive":
                 column_colors.append(SENTIMENT_COLORS[2])  # Green
-        
+
         sentiment_by_stars.plot(
             kind="bar",
             ax=ax2,
@@ -341,14 +330,18 @@ def scrape_and_analyze(app_url_or_id, num_reviews=100):
         sample_reviews = f"📝 Sample Reviews (Showing 20 out of {total} reviews):\n"
         sample_reviews += f"💾 Download the CSV file below to get all {total} reviews with their sentiments!\n\n"
         sample_reviews += "=" * 80 + "\n\n"
-        
+
         sample_df = df.head(20)
         for idx, (index, row) in enumerate(sample_df.iterrows(), 1):
             emoji = SENTIMENT_EMOJI[
                 [k for k, v in SENTIMENT_LABELS.items() if v == row["AI_Sentiment"]][0]
             ]
-            date_str = row['Date'].strftime('%Y-%m-%d') if hasattr(row['Date'], 'strftime') else str(row['Date'])
-            
+            date_str = (
+                row["Date"].strftime("%Y-%m-%d")
+                if hasattr(row["Date"], "strftime")
+                else str(row["Date"])
+            )
+
             sample_reviews += f"Review #{idx} | {date_str} | ⭐ {row['Star_Rating']}/5 | {emoji} {row['AI_Sentiment']}\n"
             sample_reviews += f"📝 {row['Review'][:200]}{'...' if len(row['Review']) > 200 else ''}\n"
             sample_reviews += "-" * 60 + "\n\n"
@@ -550,9 +543,8 @@ with gr.Blocks(
                         label="📝 Sample Reviews (Preview)",
                         lines=15,
                         interactive=False,
-                        show_copy_button=True,
                     )
-                
+
                 with gr.Column(scale=1):
                     gr.Markdown(
                         """
@@ -569,12 +561,12 @@ with gr.Blocks(
                         - Sentiment confidence score
                         """
                     )
-                    
+
                     # CSV download
                     csv_output = gr.File(
-                        label="� Download CSV File", 
+                        label="📥 Download CSV File",
                         visible=True,
-                        interactive=False
+                        interactive=False,
                     )
 
             def scrape_wrapper(app_url_or_id, num_reviews):
@@ -582,18 +574,17 @@ with gr.Blocks(
                     app_url_or_id, num_reviews
                 )
                 if csv_data and csv_data != "":
-                    # Save to temp file
-                    import tempfile
-                    import os
-
                     # Extract clean package name for filename
                     package_name = extract_package_name(app_url_or_id)
-                    safe_package_name = package_name.replace(".", "_").replace("/", "_") if package_name else "app"
-                    
+                    safe_package_name = (
+                        package_name.replace(".", "_").replace("/", "_")
+                        if package_name
+                        else "app"
+                    )
+
                     # Get current timestamp for unique filename
-                    from datetime import datetime
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    
+
                     with tempfile.NamedTemporaryFile(
                         mode="w",
                         delete=False,
